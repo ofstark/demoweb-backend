@@ -1,23 +1,53 @@
 """
-Live environmental data from Open-Meteo — free, no API key required.
+Live environmental data from Open-Meteo.
 
-- Forecast API gives hourly precipitation and soil moisture.
-- Flood API gives daily river discharge (m3/s), used as a river-level
-  proxy since a public, keyless, global river *stage* (meters) API
-  does not exist. If you have access to a real gauge network (e.g.
-  CWC in India, USGS in the US) for your region, replace
-  `get_river_signal` with a call to that instead — the rest of the
-  scoring pipeline doesn't care where the number came from.
+Provides:
+- Recent rainfall
+- Soil moisture
+- River discharge proxy
+
+All external requests have fallbacks so one unavailable upstream
+service does not crash the complete FloodGuard dashboard.
 """
 
 import httpx
+
 from app.config import settings
 from app.cache import weather_cache
 
 
+async def _get_json(url: str, params: dict) -> dict:
+    """Make a safe HTTP request to an upstream API."""
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(15.0, connect=5.0)
+        ) as client:
+            response = await client.get(url, params=params)
+
+            print(
+                f"[OPEN-METEO] {response.status_code} "
+                f"{response.url}",
+                flush=True,
+            )
+
+            response.raise_for_status()
+            return response.json()
+
+    except Exception as exc:
+        print(
+            f"[OPEN-METEO ERROR] "
+            f"{type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        raise
+
+
 async def get_rainfall_signal(lat: float, lon: float) -> dict:
-    """Returns last-6h rainfall total (mm) and a simple trend label."""
+    """Return rainfall during the recent 6-hour period."""
+
     cache_key = ("rainfall", round(lat, 3), round(lon, 3))
+
     if cache_key in weather_cache:
         return weather_cache[cache_key]
 
@@ -29,39 +59,82 @@ async def get_rainfall_signal(lat: float, lon: float) -> dict:
         "forecast_days": 1,
         "timezone": "auto",
     }
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.get(settings.open_meteo_forecast_url, params=params)
-        resp.raise_for_status()
-        data = resp.json()
 
-    hourly = data.get("hourly", {})
-    precip_series: list[float] = hourly.get("precipitation", []) or []
+    try:
+        data = await _get_json(
+            settings.open_meteo_forecast_url,
+            params,
+        )
 
-    # Find "now" as the last entry with actual (non-forecast) data by
-    # taking the most recent 6 hours of the past_days=1 + forecast_days=1
-    # window's first half (past 24h are indices 0-23).
-    past_24h = precip_series[:24] if len(precip_series) >= 24 else precip_series
-    last_6h = past_24h[-6:] if len(past_24h) >= 6 else past_24h
-    prev_6h = past_24h[-12:-6] if len(past_24h) >= 12 else []
+        hourly = data.get("hourly", {})
 
-    rainfall_6h = round(sum(last_6h), 1)
-    rainfall_prev_6h = round(sum(prev_6h), 1) if prev_6h else rainfall_6h
+        precipitation = (
+            hourly.get("precipitation", []) or []
+        )
 
-    if rainfall_6h > rainfall_prev_6h * 1.1:
-        trend = "Increasing"
-    elif rainfall_6h < rainfall_prev_6h * 0.9:
-        trend = "Decreasing"
-    else:
-        trend = "Steady"
+        if not precipitation:
+            raise ValueError(
+                "Open-Meteo returned no precipitation data"
+            )
 
-    result = {"rainfall_6h_mm": rainfall_6h, "trend": trend}
+        # Use the latest six available hourly values.
+        last_6h = precipitation[-6:]
+
+        previous_6h = (
+            precipitation[-12:-6]
+            if len(precipitation) >= 12
+            else []
+        )
+
+        rainfall_6h = round(
+            sum(float(x or 0) for x in last_6h),
+            1,
+        )
+
+        rainfall_previous = (
+            round(
+                sum(float(x or 0) for x in previous_6h),
+                1,
+            )
+            if previous_6h
+            else rainfall_6h
+        )
+
+        if rainfall_6h > rainfall_previous * 1.1:
+            trend = "Increasing"
+        elif rainfall_6h < rainfall_previous * 0.9:
+            trend = "Decreasing"
+        else:
+            trend = "Steady"
+
+        result = {
+            "rainfall_6h_mm": rainfall_6h,
+            "trend": trend,
+        }
+
+    except Exception as exc:
+        print(
+            f"[RAINFALL FALLBACK] "
+            f"lat={lat}, lon={lon}, "
+            f"{type(exc).__name__}: {exc}",
+            flush=True,
+        )
+
+        # Neutral fallback so the dashboard remains operational.
+        result = {
+            "rainfall_6h_mm": 0.0,
+            "trend": "Unknown",
+        }
+
     weather_cache[cache_key] = result
     return result
 
 
 async def get_soil_moisture_signal(lat: float, lon: float) -> dict:
-    """Returns near-surface soil moisture as a 0-100 saturation percentage."""
+    """Return near-surface soil moisture as a percentage."""
+
     cache_key = ("soil", round(lat, 3), round(lon, 3))
+
     if cache_key in weather_cache:
         return weather_cache[cache_key]
 
@@ -72,28 +145,58 @@ async def get_soil_moisture_signal(lat: float, lon: float) -> dict:
         "forecast_days": 1,
         "timezone": "auto",
     }
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.get(settings.open_meteo_forecast_url, params=params)
-        resp.raise_for_status()
-        data = resp.json()
 
-    series: list[float] = data.get("hourly", {}).get("soil_moisture_0_to_1cm", []) or []
-    latest = series[-1] if series else 0.2  # m3/m3, fallback mid-range
+    try:
+        data = await _get_json(
+            settings.open_meteo_forecast_url,
+            params,
+        )
 
-    # Open-Meteo reports volumetric water content (m3/m3), typical range
-    # 0.0 (dry) to ~0.5 (saturated) depending on soil type. Normalize to
-    # a 0-100 "saturation" style percentage for the UI.
-    saturation_pct = round(min(max(latest / 0.5, 0), 1) * 100, 1)
+        series = (
+            data.get("hourly", {})
+            .get("soil_moisture_0_to_1cm", [])
+            or []
+        )
 
-    result = {"soil_moisture_pct": saturation_pct}
+        if not series:
+            raise ValueError(
+                "Open-Meteo returned no soil moisture data"
+            )
+
+        latest = float(series[-1])
+
+        # Convert volumetric water content to a simple
+        # 0-100 UI percentage.
+        saturation_pct = round(
+            min(max(latest / 0.5, 0), 1) * 100,
+            1,
+        )
+
+        result = {
+            "soil_moisture_pct": saturation_pct,
+        }
+
+    except Exception as exc:
+        print(
+            f"[SOIL FALLBACK] "
+            f"lat={lat}, lon={lon}, "
+            f"{type(exc).__name__}: {exc}",
+            flush=True,
+        )
+
+        result = {
+            "soil_moisture_pct": 40.0,
+        }
+
     weather_cache[cache_key] = result
     return result
 
 
 async def get_river_signal(lat: float, lon: float) -> dict:
-    """Returns river discharge (m3/s) and its recent rate of change, used
-    as a river-level proxy."""
+    """Return river discharge and recent discharge change."""
+
     cache_key = ("river", round(lat, 3), round(lon, 3))
+
     if cache_key in weather_cache:
         return weather_cache[cache_key]
 
@@ -104,25 +207,49 @@ async def get_river_signal(lat: float, lon: float) -> dict:
         "past_days": 3,
         "forecast_days": 1,
     }
+
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(settings.open_meteo_flood_url, params=params)
-            resp.raise_for_status()
-            data = resp.json()
-        series: list[float] = data.get("daily", {}).get("river_discharge", []) or []
-    except httpx.HTTPError:
-        # Flood API has limited global coverage (mainly larger rivers) —
-        # fall back to a neutral reading rather than failing the request.
-        series = []
+        data = await _get_json(
+            settings.open_meteo_flood_url,
+            params,
+        )
 
-    if len(series) >= 2:
-        latest, previous = series[-1], series[-2]
-        rate = round(latest - previous, 2)
-    elif series:
-        latest, rate = series[-1], 0.0
-    else:
-        latest, rate = 0.0, 0.0
+        series = (
+            data.get("daily", {})
+            .get("river_discharge", [])
+            or []
+        )
 
-    result = {"discharge_m3s": round(latest, 2), "discharge_rate": rate}
+        if len(series) >= 2:
+            latest = float(series[-1])
+            previous = float(series[-2])
+            rate = round(latest - previous, 2)
+
+        elif series:
+            latest = float(series[-1])
+            rate = 0.0
+
+        else:
+            latest = 0.0
+            rate = 0.0
+
+        result = {
+            "discharge_m3s": round(latest, 2),
+            "discharge_rate": rate,
+        }
+
+    except Exception as exc:
+        print(
+            f"[RIVER FALLBACK] "
+            f"lat={lat}, lon={lon}, "
+            f"{type(exc).__name__}: {exc}",
+            flush=True,
+        )
+
+        result = {
+            "discharge_m3s": 0.0,
+            "discharge_rate": 0.0,
+        }
+
     weather_cache[cache_key] = result
     return result
