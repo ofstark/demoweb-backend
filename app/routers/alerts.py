@@ -1,64 +1,97 @@
 from datetime import datetime, timezone
+
 from fastapi import APIRouter, HTTPException
+
 from app.data.zones import ZONES
 from app.models.schemas import AlertItem
 from app.services.prediction import build_all_predictions
 
-# AUTH TEMPORARILY DISABLED — re-add `Depends(get_current_user)` to
-# dependencies below once login is confirmed working end-to-end.
 router = APIRouter(prefix="/api", tags=["alerts"])
-
-# NOTE: this derives alerts live from current risk levels on every call.
-# For real alert history (resolved alerts, "12 minutes ago" timestamps
-# that persist across restarts), back this with a database that logs
-# each risk-level change as it happens, rather than recomputing here.
 
 
 @router.get("/alerts", response_model=list[AlertItem])
 async def get_alerts():
+    """
+    Generate live alerts from the current flood-risk predictions.
+
+    Alerts are derived from the latest predictions each time this
+    endpoint is requested.
+    """
+
     try:
         predictions = await build_all_predictions(ZONES)
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"Upstream data fetch failed: {exc}") from exc
+
+    except Exception as exc:
+        # Print the real error to Render logs so it can be diagnosed.
+        print(
+            f"[ALERTS ERROR] "
+            f"{type(exc).__name__}: {exc}",
+            flush=True,
+        )
+
+        # Return a useful error to the frontend.
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "Failed to fetch prediction data",
+                "error": type(exc).__name__,
+                "details": str(exc),
+            },
+        ) from exc
 
     now = datetime.now(timezone.utc).strftime("%H:%M UTC")
+
     alerts: list[AlertItem] = []
 
-    for p in predictions:
-        if p.risk == "CRITICAL":
+    for prediction in predictions:
+
+        if prediction.risk == "CRITICAL":
             alerts.append(
                 AlertItem(
-                    id=f"alert-{p.id}",
+                    id=f"alert-{prediction.id}",
                     title="CRITICAL RISK DETECTED",
-                    location=p.location,
+                    location=prediction.location,
                     severity="CRITICAL",
                     timestamp=now,
                     status="ACTIVE",
-                    description=f"Probability {p.probability}% — rainfall {p.rainfall}mm, soil moisture {p.soilMoisture}%.",
+                    description=(
+                        f"Probability {prediction.probability}% — "
+                        f"rainfall {prediction.rainfall}mm, "
+                        f"soil moisture {prediction.soilMoisture}%."
+                    ),
                 )
             )
-        elif p.risk == "HIGH":
+
+        elif prediction.risk == "HIGH":
             alerts.append(
                 AlertItem(
-                    id=f"alert-{p.id}",
+                    id=f"alert-{prediction.id}",
                     title="HIGH RISK DETECTED",
-                    location=p.location,
+                    location=prediction.location,
                     severity="HIGH",
                     timestamp=now,
                     status="ACTIVE",
-                    description=f"Probability {p.probability}% — rainfall {p.rainfall}mm, soil moisture {p.soilMoisture}%.",
+                    description=(
+                        f"Probability {prediction.probability}% — "
+                        f"rainfall {prediction.rainfall}mm, "
+                        f"soil moisture {prediction.soilMoisture}%."
+                    ),
                 )
             )
-        elif p.risk == "MODERATE":
+
+        elif prediction.risk == "MODERATE":
             alerts.append(
                 AlertItem(
-                    id=f"alert-{p.id}",
+                    id=f"alert-{prediction.id}",
                     title="ELEVATED CONDITIONS",
-                    location=p.location,
+                    location=prediction.location,
                     severity="MODERATE",
                     timestamp=now,
                     status="MONITORING",
-                    description=f"Probability {p.probability}% — conditions trending upward.",
+                    description=(
+                        f"Probability {prediction.probability}% — "
+                        f"conditions trending upward."
+                    ),
                 )
             )
 
