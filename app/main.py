@@ -1,23 +1,29 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.config import settings
+
 from app.routers import predictions, locations, alerts, geography, auth
 
 app = FastAPI(
     title="FloodGuard AI API",
-    description="Flash-flood risk prediction backend — Tier 1 weighted scoring "
-    "over live rainfall, soil moisture, river discharge and terrain data.",
+    description=(
+        "Flash-flood risk prediction backend — Tier 1 weighted scoring "
+        "over live rainfall, soil moisture, river discharge and terrain data."
+    ),
     version="0.1.0",
 )
 
+# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.cors_origin_list,
+    allow_origins=[
+        "https://demoweb-cybh.onrender.com",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Routers
 app.include_router(auth.router)
 app.include_router(predictions.router)
 app.include_router(locations.router)
