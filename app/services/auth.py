@@ -10,7 +10,12 @@ def verify_password(plain_password: str, password_hash: str) -> bool:
     if not password_hash:
         # No hash configured yet — refuse rather than silently allowing in.
         return False
-    return pwd_context.verify(plain_password, password_hash)
+    try:
+        return pwd_context.verify(plain_password, password_hash)
+    except (ValueError, TypeError):
+        # Malformed hash (e.g. stray whitespace/newline from copy-pasting
+        # into an env var) — treat as a failed login, not a server error.
+        return False
 
 
 def hash_password(plain_password: str) -> str:

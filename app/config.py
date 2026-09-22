@@ -21,6 +21,13 @@ class Settings(BaseSettings):
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
 
+    def model_post_init(self, __context) -> None:
+        # Guard against trailing whitespace/newlines from copy-pasting
+        # secrets into a hosting provider's env var UI.
+        self.astra_password_hash = self.astra_password_hash.strip()
+        self.jwt_secret_key = self.jwt_secret_key.strip()
+        self.astra_username = self.astra_username.strip()
+
     class Config:
         env_file = ".env"
 

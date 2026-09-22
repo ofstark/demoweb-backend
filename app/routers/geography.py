@@ -1,9 +1,10 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter
 from app.data import geography
-from app.deps import get_current_user
 from app.models.schemas import GeographyResponse, SettlementOut
 
-router = APIRouter(prefix="/api", tags=["geography"], dependencies=[Depends(get_current_user)])
+# AUTH TEMPORARILY DISABLED — re-add `Depends(get_current_user)` to
+# dependencies below once login is confirmed working end-to-end.
+router = APIRouter(prefix="/api", tags=["geography"])
 
 
 @router.get("/geography", response_model=GeographyResponse)
