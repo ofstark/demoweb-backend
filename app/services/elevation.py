@@ -1,55 +1,123 @@
 """
-Terrain steepness proxy via Open-Elevation (free, no API key).
+Terrain steepness proxy via Open-Elevation.
 
-We sample the target point plus four neighbors ~500m to the north,
-south, east and west, then compute the maximum elevation difference
-across those samples as a simple slope proxy. This is intentionally
-crude — for a real system, replace this with a proper DEM-derived
-slope raster (e.g. via OpenTopography's SRTM data) sampled once per
-zone at higher resolution.
+Samples the target point plus four nearby points and estimates
+terrain steepness from the elevation range.
+
+For production flood prediction, replace this with a proper
+DEM-derived slope raster.
 """
 
 import httpx
+
 from app.config import settings
 from app.cache import elevation_cache
 
-# ~500m in degrees latitude; longitude offset adjusted per-latitude below.
+
+# Approximately 500 m in latitude.
 OFFSET_DEG = 0.0045
 
 
 async def get_slope_signal(lat: float, lon: float) -> dict:
-    cache_key = ("slope", round(lat, 3), round(lon, 3))
+    cache_key = (
+        "slope",
+        round(lat, 3),
+        round(lon, 3),
+    )
+
     if cache_key in elevation_cache:
         return elevation_cache[cache_key]
 
-    lon_offset = OFFSET_DEG  # good enough approximation at mid-latitudes
     points = [
         (lat, lon),
         (lat + OFFSET_DEG, lon),
         (lat - OFFSET_DEG, lon),
-        (lat, lon + lon_offset),
-        (lat, lon - lon_offset),
+        (lat, lon + OFFSET_DEG),
+        (lat, lon - OFFSET_DEG),
     ]
-    locations_param = "|".join(f"{p_lat},{p_lon}" for p_lat, p_lon in points)
+
+    locations_param = "|".join(
+        f"{point_lat},{point_lon}"
+        for point_lat, point_lon in points
+    )
+
+    slope_score = 50.0
 
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(
-                settings.open_elevation_url, params={"locations": locations_param}
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(
+                15.0,
+                connect=5.0,
             )
-            resp.raise_for_status()
-            data = resp.json()
-        elevations = [r["elevation"] for r in data.get("results", [])]
-    except (httpx.HTTPError, KeyError):
+        ) as client:
+
+            response = await client.get(
+                settings.open_elevation_url,
+                params={
+                    "locations": locations_param,
+                },
+            )
+
+            print(
+                f"[OPEN-ELEVATION] "
+                f"{response.status_code} "
+                f"{response.url}",
+                flush=True,
+            )
+
+            response.raise_for_status()
+
+            data = response.json()
+
+        results = data.get("results", [])
+
         elevations = []
 
-    if len(elevations) >= 2:
-        elevation_range_m = max(elevations) - min(elevations)
-        # Normalize: >150m of relief across ~1km is steep hilly terrain.
-        slope_score = round(min(elevation_range_m / 150, 1) * 100, 1)
-    else:
-        slope_score = 50.0  # neutral fallback if lookup fails
+        for item in results:
+            elevation = item.get("elevation")
 
-    result = {"slope_score": slope_score}
+            if elevation is not None:
+                elevations.append(float(elevation))
+
+        if len(elevations) >= 2:
+
+            elevation_range_m = (
+                max(elevations) - min(elevations)
+            )
+
+            # Normalize:
+            # 0m relief → 0
+            # 150m+ relief → 100
+            slope_score = round(
+                min(elevation_range_m / 150.0, 1.0)
+                * 100.0,
+                1,
+            )
+
+        else:
+            print(
+                "[ELEVATION] Insufficient elevation data; "
+                "using neutral slope score.",
+                flush=True,
+            )
+
+    except Exception as exc:
+
+        print(
+            f"[ELEVATION FALLBACK] "
+            f"lat={lat}, "
+            f"lon={lon}, "
+            f"{type(exc).__name__}: {exc}",
+            flush=True,
+        )
+
+        # Neutral fallback.
+        slope_score = 50.0
+
+    result = {
+        "slope_score": slope_score,
+    }
+
     elevation_cache[cache_key] = result
+
     return result
